@@ -1,0 +1,3 @@
+/home/aditya-aman/Documents/ChatGPT/What'sThat/server/build/CMakeFiles/message_server.dir
+/home/aditya-aman/Documents/ChatGPT/What'sThat/server/build/CMakeFiles/edit_cache.dir
+/home/aditya-aman/Documents/ChatGPT/What'sThat/server/build/CMakeFiles/rebuild_cache.dir
