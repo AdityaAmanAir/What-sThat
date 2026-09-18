@@ -1,4 +1,5 @@
 #include "http_server.h"
+#include "video_stream_server.h"
 
 #include <arpa/inet.h>
 #include <cerrno>
@@ -65,6 +66,7 @@ void closeClient(const std::string& ip, std::unordered_map<std::string, int>& cl
 int main() {
   std::signal(SIGPIPE, SIG_IGN);
   std::thread(runHttpServer).detach();
+  std::thread(runVideoStreamServer).detach();
 
   const int serverFd = socket(AF_INET, SOCK_STREAM, 0);
   if (serverFd == -1) {

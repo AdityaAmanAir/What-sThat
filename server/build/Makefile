@@ -177,6 +177,30 @@ main.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/message_server.dir/build.make CMakeFiles/message_server.dir/main.cpp.s
 .PHONY : main.cpp.s
 
+video_stream_server.o: video_stream_server.cpp.o
+.PHONY : video_stream_server.o
+
+# target to build an object file
+video_stream_server.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/message_server.dir/build.make CMakeFiles/message_server.dir/video_stream_server.cpp.o
+.PHONY : video_stream_server.cpp.o
+
+video_stream_server.i: video_stream_server.cpp.i
+.PHONY : video_stream_server.i
+
+# target to preprocess a source file
+video_stream_server.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/message_server.dir/build.make CMakeFiles/message_server.dir/video_stream_server.cpp.i
+.PHONY : video_stream_server.cpp.i
+
+video_stream_server.s: video_stream_server.cpp.s
+.PHONY : video_stream_server.s
+
+# target to generate assembly for a file
+video_stream_server.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/message_server.dir/build.make CMakeFiles/message_server.dir/video_stream_server.cpp.s
+.PHONY : video_stream_server.cpp.s
+
 # Help Target
 help:
 	@echo "The following are some of the valid targets for this Makefile:"
@@ -192,6 +216,9 @@ help:
 	@echo "... main.o"
 	@echo "... main.i"
 	@echo "... main.s"
+	@echo "... video_stream_server.o"
+	@echo "... video_stream_server.i"
+	@echo "... video_stream_server.s"
 .PHONY : help
 
 

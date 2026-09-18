@@ -28,6 +28,8 @@
 	<true/>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
+	<key>NSCameraUsageDescription</key>
+	<string>This app uses the camera for live video streaming.</string>
 		<key>UIApplicationSupportsMultipleScenes</key>
 		<false/>
 		<key>UISceneConfigurations</key>
