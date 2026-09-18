@@ -1,10 +1,16 @@
 #include <algorithm>
-#include <cstdio>
+#include <arpa/inet.h>
+#include <array>
+#include <cstdint>
 #include <filesystem>
 #include <iostream>
 #include <optional>
-#include <sstream>
 #include <string>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <thread>
+#include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 #include <opencv2/dnn.hpp>
@@ -21,6 +27,8 @@ constexpr float kConfidenceThreshold = 0.40F;
 constexpr float kNmsThreshold = 0.45F;
 constexpr double kRecognizedFaceThreshold = 0.363;
 constexpr double kUnrecognizedFaceThreshold = 0.25;
+constexpr char kProcessorSocketPath[] = "/tmp/whats_that_processor.sock";
+constexpr std::uint32_t kMaxLiveFrameBytes = 10 * 1024 * 1024;
 
 const std::vector<std::string> kCocoClasses = {
     "person",       "bicycle",      "car",           "motorcycle", "airplane",
@@ -41,71 +49,26 @@ const std::vector<std::string> kCocoClasses = {
     "vase",         "scissors",     "teddy bear",    "hair drier", "toothbrush",
 };
 
-fs::path findInputVideo() {
-  const fs::path sourceDirectory = "source";
-  if (!fs::is_directory(sourceDirectory)) return {};
-
-  for (const auto& entry : fs::directory_iterator(sourceDirectory)) {
-    if (entry.is_regular_file() && entry.path().stem() == "test") {
-      return entry.path();
-    }
-  }
-  return {};
-}
-
-std::string shellQuote(const std::string& value) {
-  std::string quoted = "'";
-  for (char character : value) {
-    quoted += character == '\'' ? "'\\''" : std::string(1, character);
-  }
-  return quoted + "'";
-}
-
-struct VideoInfo {
-  int width;
-  int height;
-  double fps;
-};
-
-VideoInfo probeVideo(const fs::path& path) {
-  const std::string command =
-      "ffprobe -v error -select_streams v:0 -show_entries "
-      "stream=width,height,r_frame_rate -of default=noprint_wrappers=1:nokey=1 " +
-      shellQuote(path.string());
-  FILE* probe = popen(command.c_str(), "r");
-  if (probe == nullptr) throw std::runtime_error("Unable to run ffprobe.");
-
-  char line[128];
-  std::vector<std::string> values;
-  while (fgets(line, sizeof(line), probe) != nullptr) {
-    std::string value(line);
-    if (!value.empty() && value.back() == '\n') value.pop_back();
-    values.push_back(value);
-  }
-  if (pclose(probe) != 0 || values.size() != 3) {
-    throw std::runtime_error("Unable to read video properties with ffprobe.");
-  }
-
-  const std::size_t slash = values[2].find('/');
-  const double fps = slash == std::string::npos
-                         ? std::stod(values[2])
-                         : std::stod(values[2].substr(0, slash)) /
-                               std::stod(values[2].substr(slash + 1));
-  return {std::stoi(values[0]), std::stoi(values[1]), fps > 0 ? fps : 30.0};
-}
-
-bool readFrame(FILE* input, std::vector<unsigned char>& bytes) {
-  std::size_t read = 0;
-  while (read < bytes.size()) {
-    const std::size_t count = fread(bytes.data() + read, 1, bytes.size() - read, input);
-    if (count == 0) return false;
-    read += count;
+bool receiveAll(int fd, void* destination, std::size_t length) {
+  auto* bytes = static_cast<std::uint8_t*>(destination);
+  std::size_t received = 0;
+  while (received < length) {
+    const ssize_t result = recv(fd, bytes + received, length - received, 0);
+    if (result <= 0) return false;
+    received += static_cast<std::size_t>(result);
   }
   return true;
 }
 
-bool writeFrame(FILE* output, const std::vector<unsigned char>& bytes) {
-  return fwrite(bytes.data(), 1, bytes.size(), output) == bytes.size();
+bool sendAll(int fd, const void* source, std::size_t length) {
+  const auto* bytes = static_cast<const std::uint8_t*>(source);
+  std::size_t sent = 0;
+  while (sent < length) {
+    const ssize_t result = send(fd, bytes + sent, length - sent, MSG_NOSIGNAL);
+    if (result <= 0) return false;
+    sent += static_cast<std::size_t>(result);
+  }
+  return true;
 }
 
 struct Detection {
@@ -383,65 +346,79 @@ void drawDetections(cv::Mat& frame, cv::dnn::Net& net, ObjectTracker& tracker,
 }  // namespace
 
 int main() {
-  const fs::path inputVideo = findInputVideo();
   const fs::path model = "models/yolov5n.onnx";
   const fs::path faceDetectorModel = "models/face_detection_yunet_2023mar.onnx";
   const fs::path faceRecognitionModel = "models/face_recognition_sface_2021dec.onnx";
   const fs::path faceDatabase = fs::is_directory("face_database")
                                     ? fs::path("face_database")
                                     : fs::path("../server/face_database");
-  const fs::path outputDirectory = "output";
-  const fs::path outputVideo = outputDirectory / "test_detected.mp4";
-
-  if (inputVideo.empty()) {
-    std::cerr << "No input found. Add exactly one file named source/test.<video-extension>.\n";
-    return 1;
-  }
   if (!fs::exists(model)) {
     std::cerr << "Model missing: " << model << ". Run ./download_model.sh first.\n";
     return 1;
   }
-  fs::create_directories(outputDirectory);
-
   try {
-    const VideoInfo info = probeVideo(inputVideo);
-    const std::string decoderCommand =
-        "ffmpeg -v error -i " + shellQuote(inputVideo.string()) +
-        " -map 0:v:0 -f rawvideo -pix_fmt bgr24 -";
-    const std::string encoderCommand =
-        "ffmpeg -y -v error -f rawvideo -pixel_format bgr24 -video_size " +
-        std::to_string(info.width) + "x" + std::to_string(info.height) +
-        " -framerate " + std::to_string(info.fps) +
-        " -i - -an -c:v libx264 -pix_fmt yuv420p " + shellQuote(outputVideo.string());
-    FILE* decoder = popen(decoderCommand.c_str(), "r");
-    FILE* encoder = popen(encoderCommand.c_str(), "w");
-    if (decoder == nullptr || encoder == nullptr) {
-      if (decoder != nullptr) pclose(decoder);
-      if (encoder != nullptr) pclose(encoder);
-      throw std::runtime_error("Unable to start FFmpeg.");
+    const unsigned int cpuCores = std::max(1U, std::thread::hardware_concurrency());
+    cv::setUseOptimized(true);
+    cv::setNumThreads(static_cast<int>(cpuCores));
+    std::cout << "OpenCV CPU processing configured for " << cv::getNumThreads()
+              << " worker threads." << std::endl;
+    const int processorFd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (processorFd == -1) throw std::runtime_error("Unable to create local processor socket.");
+    sockaddr_un serverAddress{};
+    serverAddress.sun_family = AF_UNIX;
+    std::strncpy(serverAddress.sun_path, kProcessorSocketPath,
+                 sizeof(serverAddress.sun_path) - 1);
+    if (connect(processorFd, reinterpret_cast<sockaddr*>(&serverAddress), sizeof(serverAddress)) == -1) {
+      close(processorFd);
+      throw std::runtime_error("Unable to connect to the local server bridge. Start server first.");
     }
 
     cv::dnn::Net net = cv::dnn::readNetFromONNX(model.string());
-    ObjectTracker tracker;
+    net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+    net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
     FaceRecognition faceRecognition(faceDetectorModel, faceRecognitionModel, faceDatabase);
-    std::vector<unsigned char> bytes(
-        static_cast<std::size_t>(info.width) * info.height * 3);
+    std::unordered_map<std::string, ObjectTracker> trackers;
     std::size_t frameCount = 0;
-    while (readFrame(decoder, bytes)) {
-      cv::Mat frame(info.height, info.width, CV_8UC3, bytes.data());
-      drawDetections(frame, net, tracker, faceRecognition);
-      if (!writeFrame(encoder, bytes)) throw std::runtime_error("Unable to write output frame.");
+    std::cout << "Waiting for frames from the local server bridge..." << std::endl;
+    while (true) {
+      std::array<std::uint8_t, 12> header{};
+      if (!receiveAll(processorFd, header.data(), header.size()) ||
+          std::memcmp(header.data(), "INP1", 4) != 0) break;
+      std::uint32_t networkIpLength;
+      std::uint32_t networkFrameLength;
+      std::memcpy(&networkIpLength, header.data() + 4, sizeof(networkIpLength));
+      std::memcpy(&networkFrameLength, header.data() + 8, sizeof(networkFrameLength));
+      const std::uint32_t sessionIdLength = ntohl(networkIpLength);
+      const std::uint32_t frameLength = ntohl(networkFrameLength);
+      if (sessionIdLength != 32 || frameLength == 0 || frameLength > kMaxLiveFrameBytes) break;
+      std::string sessionId(sessionIdLength, '\0');
+      std::vector<std::uint8_t> encoded(frameLength);
+      if (!receiveAll(processorFd, sessionId.data(), sessionId.size()) ||
+          !receiveAll(processorFd, encoded.data(), encoded.size())) break;
+      cv::Mat frame = cv::imdecode(encoded, cv::IMREAD_COLOR);
+      if (frame.empty()) continue;
+      drawDetections(frame, net, trackers[sessionId], faceRecognition);
+      std::vector<std::uint8_t> processed;
+      if (!cv::imencode(".jpg", frame, processed, {cv::IMWRITE_JPEG_QUALITY, 80})) {
+        throw std::runtime_error("Unable to encode processed frame.");
+      }
+      std::array<std::uint8_t, 12> outputHeader{};
+      std::memcpy(outputHeader.data(), "OUT1", 4);
+      const std::uint32_t networkOutputSessionLength = htonl(sessionIdLength);
+      const std::uint32_t networkOutputFrameLength = htonl(static_cast<std::uint32_t>(processed.size()));
+      std::memcpy(outputHeader.data() + 4, &networkOutputSessionLength,
+                  sizeof(networkOutputSessionLength));
+      std::memcpy(outputHeader.data() + 8, &networkOutputFrameLength, sizeof(networkOutputFrameLength));
+      if (!sendAll(processorFd, outputHeader.data(), outputHeader.size()) ||
+          !sendAll(processorFd, sessionId.data(), sessionId.size()) ||
+          !sendAll(processorFd, processed.data(), processed.size())) break;
       ++frameCount;
-      if (frameCount % 25 == 0) {
-        std::cout << "Processed " << frameCount << " frames..." << std::endl;
+      if (frameCount % 10 == 0) {
+        std::cout << "Processed " << frameCount << " live frames." << std::endl;
       }
     }
-    const int decoderStatus = pclose(decoder);
-    const int encoderStatus = pclose(encoder);
-    if (decoderStatus != 0 || encoderStatus != 0) {
-      throw std::runtime_error("FFmpeg failed while processing the video.");
-    }
-    std::cout << "Processed " << frameCount << " frames. Output: " << outputVideo << '\n';
+    close(processorFd);
+    std::cout << "Live stream ended after " << frameCount << " frames.\n";
   } catch (const std::exception& error) {
     std::cerr << "Processing failed: " << error.what() << '\n';
     return 1;

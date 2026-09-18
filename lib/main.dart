@@ -1,12 +1,17 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
+import 'dart:typed_data';
 
+import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:image/image.dart' as image;
 import 'package:shared_preferences/shared_preferences.dart';
 
 const _serverIpKey = 'server_ip';
 const _serverPort = 5000;
+const _videoStreamPort = 5001;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -36,6 +41,285 @@ class SendMessagePage extends StatefulWidget {
 
   @override
   State<SendMessagePage> createState() => _SendMessagePageState();
+}
+
+class VideoStreamPage extends StatefulWidget {
+  const VideoStreamPage({super.key, required this.serverIp});
+
+  final String serverIp;
+
+  @override
+  State<VideoStreamPage> createState() => _VideoStreamPageState();
+}
+
+class _VideoStreamPageState extends State<VideoStreamPage> {
+  CameraController? _camera;
+  Socket? _socket;
+  Socket? _receiveSocket;
+  StreamSubscription<Uint8List>? _receiveSubscription;
+  final _receiveBuffer = <int>[];
+  Uint8List? _serverFrame;
+  late final String _streamId;
+  String _status = 'Preparing camera...';
+  bool _streaming = false;
+  bool _encodingFrame = false;
+  DateTime _lastFrameAt = DateTime.fromMillisecondsSinceEpoch(0);
+
+  @override
+  void initState() {
+    super.initState();
+    _streamId = List.generate(
+      32,
+      (_) => Random.secure().nextInt(16).toRadixString(16),
+    ).join();
+    _prepareCamera();
+  }
+
+  Future<void> _prepareCamera() async {
+    try {
+      final cameras = await availableCameras();
+      if (cameras.isEmpty) {
+        throw CameraException('no-camera', 'No camera found.');
+      }
+      final camera = CameraController(
+        cameras.first,
+        ResolutionPreset.low,
+        enableAudio: false,
+        imageFormatGroup: ImageFormatGroup.yuv420,
+      );
+      await camera.initialize();
+      if (!mounted) {
+        await camera.dispose();
+        return;
+      }
+      setState(() {
+        _camera = camera;
+        _status = 'Ready';
+      });
+    } on CameraException catch (error) {
+      if (mounted) {
+        setState(() => _status = 'Camera error: ${error.description}');
+      }
+    }
+  }
+
+  Future<void> _toggleStream() async {
+    if (_streaming) {
+      await _stopStream();
+      return;
+    }
+    if (_camera == null || !_camera!.value.isInitialized) {
+      return;
+    }
+    try {
+      _receiveSocket = await Socket.connect(
+        widget.serverIp,
+        _videoStreamPort,
+        timeout: const Duration(seconds: 5),
+      );
+      _receiveSocket!.add(utf8.encode('SUB1$_streamId'));
+      await _receiveSocket!.flush();
+      _receiveSubscription = _receiveSocket!.listen(
+        _onServerFrameData,
+        onDone: _onServerFeedClosed,
+        onError: (_, _) => _onServerFeedClosed(),
+      );
+      _socket = await Socket.connect(
+        widget.serverIp,
+        _videoStreamPort,
+        timeout: const Duration(seconds: 5),
+      );
+      _socket!.add(utf8.encode('STR1$_streamId'));
+      await _socket!.flush();
+      await _camera!.startImageStream(_onCameraImage);
+      if (mounted) {
+        setState(() {
+          _streaming = true;
+          _status = 'Streaming to ${widget.serverIp}:$_videoStreamPort';
+        });
+      }
+    } on SocketException catch (error) {
+      if (mounted) {
+        setState(() => _status = 'Could not connect: ${error.message}');
+      }
+      await _stopStream();
+    } on CameraException catch (error) {
+      if (mounted) {
+        setState(() => _status = 'Camera error: ${error.description}');
+      }
+      await _stopStream();
+    }
+  }
+
+  void _onServerFrameData(Uint8List data) {
+    _receiveBuffer.addAll(data);
+    while (_receiveBuffer.length >= 16) {
+      if (_receiveBuffer[0] != 0x46 ||
+          _receiveBuffer[1] != 0x52 ||
+          _receiveBuffer[2] != 0x4d ||
+          _receiveBuffer[3] != 0x31) {
+        _receiveBuffer.clear();
+        return;
+      }
+      final frameLength =
+          (_receiveBuffer[12] << 24) |
+          (_receiveBuffer[13] << 16) |
+          (_receiveBuffer[14] << 8) |
+          _receiveBuffer[15];
+      if (frameLength <= 0 || frameLength > 10 * 1024 * 1024) {
+        _receiveBuffer.clear();
+        return;
+      }
+      if (_receiveBuffer.length < 16 + frameLength) return;
+      final frame = Uint8List.fromList(
+        _receiveBuffer.sublist(16, 16 + frameLength),
+      );
+      _receiveBuffer.removeRange(0, 16 + frameLength);
+      if (mounted) setState(() => _serverFrame = frame);
+    }
+  }
+
+  void _onServerFeedClosed() {
+    if (mounted && _streaming) {
+      setState(() => _status = 'Streaming; no incoming server frames');
+    }
+  }
+
+  void _onCameraImage(CameraImage cameraImage) {
+    if (_encodingFrame ||
+        DateTime.now().difference(_lastFrameAt) <
+            const Duration(milliseconds: 200)) {
+      return;
+    }
+    _encodingFrame = true;
+    _lastFrameAt = DateTime.now();
+    _sendFrame(cameraImage).whenComplete(() => _encodingFrame = false);
+  }
+
+  Future<void> _sendFrame(CameraImage cameraImage) async {
+    final socket = _socket;
+    if (socket == null) return;
+    try {
+      final jpeg = _cameraImageToJpeg(cameraImage);
+      final header = ByteData(16)
+        ..setUint8(0, 0x46)
+        ..setUint8(1, 0x52)
+        ..setUint8(2, 0x4d)
+        ..setUint8(3, 0x31)
+        ..setUint32(4, cameraImage.width, Endian.big)
+        ..setUint32(8, cameraImage.height, Endian.big)
+        ..setUint32(12, jpeg.length, Endian.big);
+      socket.add(header.buffer.asUint8List());
+      socket.add(jpeg);
+      await socket.flush();
+    } on SocketException {
+      if (mounted) {
+        setState(() => _status = 'Stream connection lost');
+        _streaming = false;
+      }
+      await _stopStream();
+    }
+  }
+
+  Uint8List _cameraImageToJpeg(CameraImage cameraImage) {
+    if (cameraImage.format.group != ImageFormatGroup.yuv420) {
+      throw const FormatException(
+        'This prototype supports Android YUV420 camera frames.',
+      );
+    }
+    final output = image.Image(
+      width: cameraImage.width,
+      height: cameraImage.height,
+    );
+    final yPlane = cameraImage.planes[0];
+    final uPlane = cameraImage.planes[1];
+    final vPlane = cameraImage.planes[2];
+    for (var y = 0; y < cameraImage.height; y++) {
+      for (var x = 0; x < cameraImage.width; x++) {
+        final yValue = yPlane.bytes[y * yPlane.bytesPerRow + x];
+        final uvRow = y ~/ 2;
+        final uvColumn = x ~/ 2;
+        final uValue =
+            uPlane.bytes[uvRow * uPlane.bytesPerRow +
+                uvColumn * uPlane.bytesPerPixel!];
+        final vValue =
+            vPlane.bytes[uvRow * vPlane.bytesPerRow +
+                uvColumn * vPlane.bytesPerPixel!];
+        final red = (yValue + 1.402 * (vValue - 128)).round().clamp(0, 255);
+        final green =
+            (yValue - 0.344136 * (uValue - 128) - 0.714136 * (vValue - 128))
+                .round()
+                .clamp(0, 255);
+        final blue = (yValue + 1.772 * (uValue - 128)).round().clamp(0, 255);
+        output.setPixelRgb(x, y, red, green, blue);
+      }
+    }
+    return Uint8List.fromList(image.encodeJpg(output, quality: 70));
+  }
+
+  Future<void> _stopStream() async {
+    final camera = _camera;
+    if (camera != null && camera.value.isStreamingImages) {
+      await camera.stopImageStream();
+    }
+    await _socket?.close();
+    _socket?.destroy();
+    _socket = null;
+    await _receiveSubscription?.cancel();
+    _receiveSubscription = null;
+    await _receiveSocket?.close();
+    _receiveSocket?.destroy();
+    _receiveSocket = null;
+    _receiveBuffer.clear();
+    if (mounted) setState(() => _streaming = false);
+  }
+
+  @override
+  void dispose() {
+    _stopStream();
+    _camera?.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final camera = _camera;
+    return Scaffold(
+      appBar: AppBar(title: const Text('Live camera stream')),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(_status),
+            const SizedBox(height: 16),
+            if (camera != null && camera.value.isInitialized)
+              AspectRatio(
+                aspectRatio: camera.value.aspectRatio,
+                child: CameraPreview(camera),
+              )
+            else
+              const Expanded(child: Center(child: CircularProgressIndicator())),
+            const SizedBox(height: 16),
+            FilledButton(
+              onPressed: camera == null ? null : _toggleStream,
+              child: Text(_streaming ? 'Stop stream' : 'Start stream'),
+            ),
+            const SizedBox(height: 16),
+            const Text('Incoming server frames'),
+            const SizedBox(height: 8),
+            if (_serverFrame != null)
+              SizedBox(
+                height: 160,
+                child: Image.memory(_serverFrame!, fit: BoxFit.contain),
+              )
+            else
+              const SizedBox(height: 40, child: Center(child: Text('Idle'))),
+          ],
+        ),
+      ),
+    );
+  }
 }
 
 class _SendMessagePageState extends State<SendMessagePage> {
@@ -160,6 +444,18 @@ class _SendMessagePageState extends State<SendMessagePage> {
     }
   }
 
+  Future<void> _openVideoStream() async {
+    if (_serverIp.isEmpty) {
+      _showMessage('Set the server IP in Settings first.');
+      return;
+    }
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => VideoStreamPage(serverIp: _serverIp),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final server = _serverIp.isEmpty
@@ -199,6 +495,12 @@ class _SendMessagePageState extends State<SendMessagePage> {
             FilledButton(
               onPressed: _isConnecting ? null : _sendMessage,
               child: const Text('Send'),
+            ),
+            const SizedBox(height: 8),
+            OutlinedButton.icon(
+              onPressed: _openVideoStream,
+              icon: const Icon(Icons.videocam),
+              label: const Text('Stream camera to server'),
             ),
             const SizedBox(height: 20),
             const Text('Received messages'),

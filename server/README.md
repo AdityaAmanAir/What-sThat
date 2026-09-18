@@ -51,3 +51,18 @@ face_database/<first-name>.<UID>/3.<extension>
 
 On Linux, port 80 normally requires elevated permission. Run the server with
 `sudo ./build/message_server`, or assign it permission to bind low-numbered ports.
+
+## Live camera stream
+
+The Flutter app streams camera frames to TCP port `5001` after the user taps
+**Start stream**. The server forwards each frame, with the phone's IP, through a
+local Unix socket to `server_side_process`. Its processed result is routed back
+only to that phone's subscribed Flutter connection. No video file is created.
+The terminal reports every 10 forwarded frames.
+
+If the phone reports a connection timeout while the server terminal says it is
+listening on `0.0.0.0:5001`, allow the port through the Linux firewall:
+
+```bash
+sudo ufw allow 5001/tcp
+```
