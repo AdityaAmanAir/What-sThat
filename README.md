@@ -9,6 +9,14 @@ Computer Vision (Bring Your Own Project (BYOP) : BL2026270100303 : F11 + F12
 
 ---
 
+## Requirements and Usage
+
+- Android phone with camera permission and a Linux/POSIX computer on the same Wi-Fi network.
+- Flutter SDK, CMake, a C++17 compiler, OpenCV with DNN support, and `curl`.
+- Download the YOLOv5, YuNet, and SFace models before starting the processor.
+- Start the server and processor, install the APK, and enter the computer's LAN IP in the app.
+- The app shows a simple message screen and live camera view. Start streaming to see detected objects and recognized faces returned to the phone; upload face photos through the server page first when recognition is needed.
+
 # Problem it solves :
 Live Mobile Object Detection and Face Recognition is a computer vision project that enables real-time object detection and face recognition using a mobile device. The project addresses the need for efficient and accurate detection of objects and faces in live video streams, which can be useful in various applications such as security, surveillance, and user authentication.
 
@@ -43,7 +51,7 @@ server/face_database/   Uploaded face reference images
 - Flutter SDK
 - CMake and C++17 compiler
 - OpenCV with `dnn`, `imgproc`, `imgcodecs`, and `objdetect`
-- Linux or another POSIX environment
+- Android phone and a Linux/POSIX computer for the server and processor
 
 ## Setup
 
@@ -118,8 +126,3 @@ flutter analyze
 cmake --build server/build
 cmake --build server_side_process/build
 ```
-
-## Project documents
-
-- [statement.md](statement.md): project statement, scope, users, and features
-- [Computer Vision Project Report.docx](Computer_Vision_Project_Report.docx): report for review, screenshots, and PDF export

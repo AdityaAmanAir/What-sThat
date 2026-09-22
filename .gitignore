@@ -43,3 +43,11 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Native server build and live-processing artifacts
+/server/build/
+/server_side_process/build/
+/server_side_process/source/*
+!/server_side_process/source/.gitkeep
+/server_side_process/output/*
+!/server_side_process/output/.gitkeep
