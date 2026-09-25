@@ -60,9 +60,9 @@ local Unix socket to `server_side_process`. Its processed result is routed back
 only to that phone's subscribed Flutter connection. No video file is created.
 The terminal reports every 10 forwarded frames.
 
-If the phone reports a connection timeout while the server terminal says it is
-listening on `0.0.0.0:5001`, allow the port through the Linux firewall:
+If the phone cannot connect while the server terminal says it is
+listening on `0.0.0.0:5001`, allow both TCP and UDP through the Linux firewall:
 
 ```bash
-sudo ufw allow 5001/tcp
+sudo ufw allow 5001
 ```

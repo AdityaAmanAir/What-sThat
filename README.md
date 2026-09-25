@@ -117,7 +117,25 @@ Flutter -> server TCP 5001 -> local Unix socket -> server_side_process
 Flutter <- server TCP 5001 <- local Unix socket <- processed frame
 ```
 
-Each Flutter stream has a random session ID. The server carries this ID through the vision pipeline and forwards the processed frame only to the matching app session.
+## Keep in mind
+
+- **Two processes required**: Always start **both** `message_server` (Terminal 1) and `yolo_video_detector` (Terminal 2). If the detector is not running, the server will receive camera frames but have no backend to process them.
+- **University / Campus Wi-Fi restrictions**: Enterprise and campus Wi-Fi networks enforce **AP/Client Isolation** and block peer-to-peer UDP/TCP traffic between devices. For reliable testing and live evaluations, connect both your laptop and phone to a **Mobile Hotspot**.
+- **TCP vs UDP streaming toggle**:
+  - **TCP (Reliable)**: Recommended when on restricted networks or firewalls. Retransmits lost frames and prevents packet drop.
+  - **UDP (Fast)**: Lowest latency under clean local networks. If the app displays `sent frames 10, 20...` but `recv: 0`, UDP is being filtered by the router or firewall—switch the in-app toggle to **TCP (Reliable)**.
+- **Linux firewall (UFW)**: If `ufw` is active on Linux, ensure both TCP and UDP on port `5001` are allowed:
+  ```bash
+  sudo ufw allow 5001
+  ```
+- **Zero Wi-Fi fallback (USB / ADB reverse)**: If no Wi-Fi is available, connect your phone via USB and forward ports:
+  ```bash
+  adb reverse tcp:5000 tcp:5000
+  adb reverse tcp:5001 tcp:5001
+  ```
+  Then set the server IP in the app Settings to `127.0.0.1`.
+- **Restart detector after face upload**: The face database is indexed at startup. After uploading photos through the web portal (`http://<server-ip>/`), restart `yolo_video_detector` to load the new embeddings.
+- **Model swapping**: You can swap `yolov5n.onnx` for a larger model like `yolov5s.onnx` without recoding or recompiling by keeping the filename `yolov5n.onnx`.
 
 ## Validation
 
@@ -126,3 +144,4 @@ flutter analyze
 cmake --build server/build
 cmake --build server_side_process/build
 ```
+

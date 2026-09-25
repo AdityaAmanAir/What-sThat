@@ -346,12 +346,23 @@ void drawDetections(cv::Mat& frame, cv::dnn::Net& net, ObjectTracker& tracker,
 }  // namespace
 
 int main() {
-  const fs::path model = "models/yolov5n.onnx";
-  const fs::path faceDetectorModel = "models/face_detection_yunet_2023mar.onnx";
-  const fs::path faceRecognitionModel = "models/face_recognition_sface_2021dec.onnx";
-  const fs::path faceDatabase = fs::is_directory("face_database")
-                                    ? fs::path("face_database")
-                                    : fs::path("../server/face_database");
+  fs::path model = "models/yolov5n.onnx";
+  if (!fs::exists(model)) model = "server_side_process/models/yolov5n.onnx";
+  if (!fs::exists(model)) model = "../server_side_process/models/yolov5n.onnx";
+
+  fs::path faceDetectorModel = "models/face_detection_yunet_2023mar.onnx";
+  if (!fs::exists(faceDetectorModel)) faceDetectorModel = "server_side_process/models/face_detection_yunet_2023mar.onnx";
+  if (!fs::exists(faceDetectorModel)) faceDetectorModel = "../server_side_process/models/face_detection_yunet_2023mar.onnx";
+
+  fs::path faceRecognitionModel = "models/face_recognition_sface_2021dec.onnx";
+  if (!fs::exists(faceRecognitionModel)) faceRecognitionModel = "server_side_process/models/face_recognition_sface_2021dec.onnx";
+  if (!fs::exists(faceRecognitionModel)) faceRecognitionModel = "../server_side_process/models/face_recognition_sface_2021dec.onnx";
+
+  fs::path faceDatabase = fs::is_directory("face_database")
+                              ? fs::path("face_database")
+                              : (fs::is_directory("../server/face_database")
+                                     ? fs::path("../server/face_database")
+                                     : fs::path("server/face_database"));
   if (!fs::exists(model)) {
     std::cerr << "Model missing: " << model << ". Run ./download_model.sh first.\n";
     return 1;
@@ -362,65 +373,105 @@ int main() {
     cv::setNumThreads(static_cast<int>(cpuCores));
     std::cout << "OpenCV CPU processing configured for " << cv::getNumThreads()
               << " worker threads." << std::endl;
-    const int processorFd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (processorFd == -1) throw std::runtime_error("Unable to create local processor socket.");
-    sockaddr_un serverAddress{};
-    serverAddress.sun_family = AF_UNIX;
-    std::strncpy(serverAddress.sun_path, kProcessorSocketPath,
-                 sizeof(serverAddress.sun_path) - 1);
-    if (connect(processorFd, reinterpret_cast<sockaddr*>(&serverAddress), sizeof(serverAddress)) == -1) {
-      close(processorFd);
-      throw std::runtime_error("Unable to connect to the local server bridge. Start server first.");
-    }
 
     cv::dnn::Net net = cv::dnn::readNetFromONNX(model.string());
     net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
     net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
     FaceRecognition faceRecognition(faceDetectorModel, faceRecognitionModel, faceDatabase);
+
     std::unordered_map<std::string, ObjectTracker> trackers;
-    std::size_t frameCount = 0;
-    std::cout << "Waiting for frames from the local server bridge..." << std::endl;
+
+    sockaddr_un abstractAddr{};
+    abstractAddr.sun_family = AF_UNIX;
+    abstractAddr.sun_path[0] = '\0';
+    std::strncpy(abstractAddr.sun_path + 1, "whats_that_processor", sizeof(abstractAddr.sun_path) - 2);
+    const socklen_t abstractLen = sizeof(sa_family_t) + 1 + std::strlen("whats_that_processor");
+
+    sockaddr_un fileAddr{};
+    fileAddr.sun_family = AF_UNIX;
+    std::strncpy(fileAddr.sun_path, kProcessorSocketPath, sizeof(fileAddr.sun_path) - 1);
+
     while (true) {
-      std::array<std::uint8_t, 12> header{};
-      if (!receiveAll(processorFd, header.data(), header.size()) ||
-          std::memcmp(header.data(), "INP1", 4) != 0) break;
-      std::uint32_t networkIpLength;
-      std::uint32_t networkFrameLength;
-      std::memcpy(&networkIpLength, header.data() + 4, sizeof(networkIpLength));
-      std::memcpy(&networkFrameLength, header.data() + 8, sizeof(networkFrameLength));
-      const std::uint32_t sessionIdLength = ntohl(networkIpLength);
-      const std::uint32_t frameLength = ntohl(networkFrameLength);
-      if (sessionIdLength != 32 || frameLength == 0 || frameLength > kMaxLiveFrameBytes) break;
-      std::string sessionId(sessionIdLength, '\0');
-      std::vector<std::uint8_t> encoded(frameLength);
-      if (!receiveAll(processorFd, sessionId.data(), sessionId.size()) ||
-          !receiveAll(processorFd, encoded.data(), encoded.size())) break;
-      cv::Mat frame = cv::imdecode(encoded, cv::IMREAD_COLOR);
-      if (frame.empty()) continue;
-      drawDetections(frame, net, trackers[sessionId], faceRecognition);
-      std::vector<std::uint8_t> processed;
-      if (!cv::imencode(".jpg", frame, processed, {cv::IMWRITE_JPEG_QUALITY, 80})) {
-        throw std::runtime_error("Unable to encode processed frame.");
+      int processorFd = -1;
+      std::cout << "Waiting for local server bridge via internal IPC..." << std::endl;
+      while (processorFd == -1) {
+        int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd != -1) {
+          int bufSize = 4 * 1024 * 1024;
+          setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufSize, sizeof(bufSize));
+          setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufSize, sizeof(bufSize));
+
+          if (connect(fd, reinterpret_cast<sockaddr*>(&abstractAddr), abstractLen) == 0) {
+            processorFd = fd;
+            break;
+          }
+          if (connect(fd, reinterpret_cast<sockaddr*>(&fileAddr), sizeof(fileAddr)) == 0) {
+            processorFd = fd;
+            break;
+          }
+          close(fd);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
       }
-      std::array<std::uint8_t, 12> outputHeader{};
-      std::memcpy(outputHeader.data(), "OUT1", 4);
-      const std::uint32_t networkOutputSessionLength = htonl(sessionIdLength);
-      const std::uint32_t networkOutputFrameLength = htonl(static_cast<std::uint32_t>(processed.size()));
-      std::memcpy(outputHeader.data() + 4, &networkOutputSessionLength,
-                  sizeof(networkOutputSessionLength));
-      std::memcpy(outputHeader.data() + 8, &networkOutputFrameLength, sizeof(networkOutputFrameLength));
-      if (!sendAll(processorFd, outputHeader.data(), outputHeader.size()) ||
-          !sendAll(processorFd, sessionId.data(), sessionId.size()) ||
-          !sendAll(processorFd, processed.data(), processed.size())) break;
-      ++frameCount;
-      if (frameCount % 10 == 0) {
-        std::cout << "Processed " << frameCount << " live frames." << std::endl;
+
+      std::cout << "Connected to local server bridge via internal IPC. Ready for frames!" << std::endl;
+      std::size_t frameCount = 0;
+
+      while (true) {
+        std::array<std::uint8_t, 12> header{};
+        if (!receiveAll(processorFd, header.data(), header.size()) ||
+            std::memcmp(header.data(), "INP1", 4) != 0) break;
+        std::uint32_t networkIpLength;
+        std::uint32_t networkFrameLength;
+        std::memcpy(&networkIpLength, header.data() + 4, sizeof(networkIpLength));
+        std::memcpy(&networkFrameLength, header.data() + 8, sizeof(networkFrameLength));
+        const std::uint32_t sessionIdLength = ntohl(networkIpLength);
+        const std::uint32_t frameLength = ntohl(networkFrameLength);
+        if (sessionIdLength != 32 || frameLength == 0 || frameLength > kMaxLiveFrameBytes) break;
+        std::string sessionId(sessionIdLength, '\0');
+        std::vector<std::uint8_t> encoded(frameLength);
+        if (!receiveAll(processorFd, sessionId.data(), sessionId.size()) ||
+            !receiveAll(processorFd, encoded.data(), encoded.size())) break;
+
+        cv::Mat frame = cv::imdecode(encoded, cv::IMREAD_COLOR);
+        std::vector<std::uint8_t> processed;
+        if (!frame.empty()) {
+          drawDetections(frame, net, trackers[sessionId], faceRecognition);
+          cv::imencode(".jpg", frame, processed, {cv::IMWRITE_JPEG_QUALITY, 70});
+        } else {
+          std::cerr << "[PROCESSOR] WARNING: cv::imdecode failed to decode frame of "
+                    << encoded.size() << " bytes!" << std::endl;
+        }
+        if (processed.empty()) {
+          processed = std::move(encoded);
+        }
+
+        std::array<std::uint8_t, 12> outputHeader{};
+        std::memcpy(outputHeader.data(), "OUT1", 4);
+        const std::uint32_t networkOutputSessionLength = htonl(sessionIdLength);
+        const std::uint32_t networkOutputFrameLength = htonl(static_cast<std::uint32_t>(processed.size()));
+        std::memcpy(outputHeader.data() + 4, &networkOutputSessionLength,
+                    sizeof(networkOutputSessionLength));
+        std::memcpy(outputHeader.data() + 8, &networkOutputFrameLength, sizeof(networkOutputFrameLength));
+        if (!sendAll(processorFd, outputHeader.data(), outputHeader.size()) ||
+            !sendAll(processorFd, sessionId.data(), sessionId.size()) ||
+            !sendAll(processorFd, processed.data(), processed.size())) break;
+        ++frameCount;
+        if (frameCount == 1 || frameCount % 10 == 0) {
+          std::cout << "[PROCESSOR] Frame #" << frameCount << ": "
+                    << (frame.empty() ? 0 : frame.cols) << "x" << (frame.empty() ? 0 : frame.rows)
+                    << " -> processed & encoded " << processed.size() << " bytes." << std::endl;
+        }
       }
+
+      close(processorFd);
+      std::cout << "Local server bridge disconnected after " << frameCount
+                << " frames. Reconnecting..." << std::endl;
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
-    close(processorFd);
-    std::cout << "Live stream ended after " << frameCount << " frames.\n";
   } catch (const std::exception& error) {
     std::cerr << "Processing failed: " << error.what() << '\n';
     return 1;
   }
+  return 0;
 }
